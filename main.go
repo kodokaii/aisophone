@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	openairt "github.com/WqyJh/go-openai-realtime"
 	"github.com/coder/websocket"
+	openairt "github.com/kodokaii/go-openai-realtime"
 )
 
 const (
@@ -24,14 +24,11 @@ const (
 	FRAME_TIME         = 20 * time.Millisecond
 	FRAME_WAIT_DIVISOR = 4
 	FRAME_SIZE_MAX     = 65500
-
-	QUEUE_SIZE_MAX  = 1400
-	QUEUE_SIZE_XOFF = 1000
-	QUEUE_SIZE_XON  = 700
 )
 
 type Config struct {
 	ApiKey string
+	Prompt string
 }
 
 type Asterisk struct {
@@ -182,7 +179,7 @@ type Session struct {
 	openai   *OpenAI
 }
 
-func NewSession(cfg Config, w http.ResponseWriter, r *http.Request) (*Session, error) {
+func NewSession(cfg *Config, w http.ResponseWriter, r *http.Request) (*Session, error) {
 	var err error
 	session := &Session{}
 
@@ -206,8 +203,21 @@ func NewSession(cfg Config, w http.ResponseWriter, r *http.Request) (*Session, e
 
 	err = session.openai.conn.SendMessage(session.ctx, openairt.SessionUpdateEvent{
 		Session: openairt.ClientSession{
+			InputAudioNoiseReduction: &openairt.InputAudioNoiseReduction{
+				Type: openairt.NearFieldNoiseReduction,
+			},
+			Instructions: cfg.Prompt,
+			Voice:        openairt.VoiceBallad,
 			TurnDetection: &openairt.ClientTurnDetection{
-				Type: openairt.ClientTurnDetectionTypeServerVad,
+				Type: openairt.ClientTurnDetectionTypeSemanticVad,
+			},
+			Tools: []openairt.Tool{
+				{
+					Type:        openairt.ToolTypeFunction,
+					Name:        "Hangup",
+					Description: "Use when the user wants to end the conversation.",
+					Parameters:  map[string]any{},
+				},
 			},
 		},
 	})
@@ -259,8 +269,6 @@ func (session *Session) StreamAsterisk(done chan struct{}) {
 			break
 		}
 
-		session.asterisk.SendText(session.ctx, "GET_STATUS")
-
 		if session.asterisk.pipe.Len() == 0 {
 			session.asterisk.RunOnPipeEmpty()
 		}
@@ -293,6 +301,8 @@ func (session *Session) HandleAsterisk(done chan struct{}) {
 				session.asterisk.Pause()
 			case strings.HasPrefix(text, "MEDIA_XON"):
 				session.asterisk.Resume()
+			default:
+				log.Printf("Unhandled Asterisk text message: %s", text)
 			}
 
 		case websocket.MessageBinary:
@@ -345,8 +355,22 @@ func (session *Session) HandleOpenAI(done chan struct{}) {
 					log.Printf("Error adding onPipeEmpty callback: %v", err)
 				}
 			}
+		case openairt.ServerEventTypeResponseDone:
+			msg := msg.(openairt.ResponseDoneEvent)
+
+			response := msg.Response
+			for _, item := range response.Output {
+				if item.Type == openairt.MessageItemTypeFunctionCall {
+					switch item.Name {
+					case "Hangup":
+						return
+					default:
+						log.Printf("Unhandled function call: %s", item.Name)
+					}
+				}
+			}
 		default:
-			//log.Printf("Unhandled OpenAI message type: %s", msg.ServerEventType())
+			//	log.Printf("\nUnhandled OpenAI message: %#v\n\n", msg)
 		}
 	}
 }
@@ -355,7 +379,7 @@ func handleCall(cfg Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		log.Println("New call received")
 
-		session, err := NewSession(cfg, w, r)
+		session, err := NewSession(&cfg, w, r)
 		if err != nil {
 			log.Printf("Failed to create session: %v", err)
 			http.Error(w, "Failed to create session", http.StatusInternalServerError)
@@ -380,13 +404,14 @@ func handleCall(cfg Config) http.HandlerFunc {
 func main() {
 	cfg := Config{
 		ApiKey: os.Getenv("OPENAI_API_KEY"),
+		Prompt: os.Getenv("OPENAI_PROMPT"),
 	}
 
 	if cfg.ApiKey == "" {
 		log.Fatal("OPENAI_API_KEY environment variable is required")
 	}
 
-	http.HandleFunc("/", handleCall(cfg))
+	http.HandleFunc("/media", handleCall(cfg))
 
 	err := http.ListenAndServe(ADDR, nil)
 	if err != nil {
